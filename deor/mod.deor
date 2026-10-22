@@ -4,10 +4,25 @@
 # EXPERIMENT NOTE: Deor (see /specification) has no unsafe, no atomics, no raw
 # pointers, no bitwise ops, no traits/generics, and no static mut globals.
 # This file is a physical-frame allocator built entirely out of those things.
-# So almost every declaration below is a thin Deor-shaped `fn`/`struct`/`enum`
-# skin wrapped around a `raw` opaque type and a `rust` block that carries the
-# real logic verbatim. That split is the honest answer to "what would this
-# look like in Deor" -- the skin is Deor, the guts stay Rust.
+#
+# Second pass: rather than wrapping whole function bodies in one `rust`
+# block each, the irreducible pieces (atomic ops, bit masks, checked
+# arithmetic, unsafe pointer/lock work) are pulled out into small
+# `raw`/one-line-`rust` primitives, and the surrounding control flow --
+# if/crash checks, for loops, plain arithmetic, delegation between functions
+# -- is written as native Deor calling those primitives. Look for functions
+# with no `rust` block at all (frame_containing, frame_next_by,
+# frame_is_aligned_to_order, map_device_memory, free_frames,
+# allocate_frame, deallocate_frame, raiiframe_take, enomem_to_error) --
+# those are the ones that came out fully native.
+#
+# The genuinely hard cases (allocate_p2frame_complex's freelist split/merge,
+# deallocate_p2frame's sibling-merge loop, init_sections) still stay as one
+# big `rust` block each: they hold multiple live mutable aliases into the
+# same freelist/array at once and, in init_sections's case, a closure
+# capturing mutable state -- Deor's clone-by-default, no-closures,
+# immutable-struct model fights that hard enough that decomposing them
+# further would mean rewriting the algorithm, not just relabeling it.
 
 # ---------------------------------------------------------------------------
 # Opaque handles onto types this file doesn't own (rmm crate, sibling modules)
@@ -81,8 +96,7 @@ fn MemoryAreaList areas()
 # ---------------------------------------------------------------------------
 
 fn int free_frames()
-    rust
-        total_frames() - used_frames()
+    return total_frames() - used_frames()
 
 fn int used_frames()
     # TODO: Include bump allocator static pages?
@@ -109,8 +123,7 @@ rust
     pub type OptFrameAndSize = Option<(Frame, usize)>;
 
 fn OptFrame allocate_frame()
-    rust
-        allocate_p2frame(0).map(|(f, _)| f)
+    return allocate_p2frame(0)
 
 fn OptFrame allocate_p2frame(int order)
     rust
@@ -281,27 +294,51 @@ fn void deallocate_p2frame(Frame orig_frame, int order)
         freelist.used_frames -= 1 << order;
 
 fn void deallocate_frame(Frame frame)
-    rust
-        unsafe { deallocate_p2frame(frame, 0) }
+    deallocate_p2frame(frame, 0)
 
-# Helper function for quickly mapping device memory
-fn VirtualAddress map_device_memory(PhysicalAddress addr, int len)
+# --- primitives: unsafe pointer/lock plumbing that has no Deor equivalent ---
+
+fn int round_down_pages_val(int addr)
+    rust
+        crate::memory::round_down_pages(addr as usize) as i64
+
+fn int round_up_pages_val(int len)
+    rust
+        crate::memory::round_up_pages(len as usize) as i64
+
+fn VirtualAddress phys_to_virt(PhysicalAddress address)
+    rust
+        RmmA::phys_to_virt(address)
+
+# Maps one page of device memory at `base + page_idx * PAGE_SIZE`.
+# NOTE: the original locks the kernel mapper once and reuses it for every
+# iteration of the loop; expressing the loop as native Deor `for` means this
+# primitive re-locks on every call instead, which is a real (if harmless
+# outside of contention) behavioral divergence from the source.
+fn void map_device_page(PhysicalAddress base, int page_idx)
     rust
         unsafe {
             let mut mapper = KernelMapper::lock_rw();
-            let base = PhysicalAddress::new(round_down_pages(addr.data()));
-            let aligned_len = round_up_pages(len as usize + (addr.data() - base.data()));
-            for page_idx in 0..aligned_len / crate::memory::PAGE_SIZE {
-                let (_, flush) = mapper
-                    .map_linearly(
-                        base.add(page_idx * crate::memory::PAGE_SIZE),
-                        PageFlags::new().write(true).device_memory(true),
-                    )
-                    .expect("failed to linearly map device memory");
-                flush.flush();
-            }
-            RmmA::phys_to_virt(addr)
+            let (_, flush) = mapper
+                .map_linearly(
+                    base.add(page_idx as usize * crate::memory::PAGE_SIZE),
+                    PageFlags::new().write(true).device_memory(true),
+                )
+                .expect("failed to linearly map device memory");
+            flush.flush();
         }
+
+# Helper function for quickly mapping device memory
+fn VirtualAddress map_device_memory(PhysicalAddress addr, int len)
+    int raw_addr = phys_addr_value(addr)
+    int down = round_down_pages_val(raw_addr)
+    PhysicalAddress base = phys_addr_from_value(down)
+    int base_addr = phys_addr_value(base)
+    int aligned_len = round_up_pages_val(len + (raw_addr - base_addr))
+    int page_count = aligned_len / PAGE_SIZE
+    for idx in range(page_count)
+        map_device_page(base, idx)
+    return phys_to_virt(addr)
 
 # ---------------------------------------------------------------------------
 # Order constants
@@ -310,10 +347,21 @@ fn VirtualAddress map_device_memory(PhysicalAddress addr, int len)
 const int ORDER_COUNT = 11
 const int MAX_ORDER = 10
 
+# PAGE_SIZE/PAGE_MASK are actually re-exported from the sibling `page` module
+# (`pub use page::*` in the original), which aliases the arch crate's
+# `rmm::Arch::PAGE_SIZE` / `PAGE_OFFSET_MASK` -- 4096 / 0xFFF on x86_64.
+# Ported as plain Deor consts since this experiment only converts this file.
+const int PAGE_SIZE = 4096
+const int PAGE_MASK = 4095
+
 # ---------------------------------------------------------------------------
 # Frame -- a NonZeroUsize physical page address with bit-packing tricks.
 # Genuinely opaque to Deor (no NonZeroUsize, no manual Ord/Hash/Debug impls),
-# so it lives behind `raw` and every "method" becomes a free function.
+# so it lives behind `raw`. Unlike the first pass at this port, only the
+# irreducible bits (extracting/building the raw address, checked add/sub,
+# the bitwise page mask, 2^order) stay as one-line `rust` primitives below --
+# the actual control flow (the zero-check, the overflow-check, the alignment
+# test) is written as native Deor calling those primitives.
 # ---------------------------------------------------------------------------
 
 raw Frame
@@ -332,42 +380,106 @@ rust
         }
     }
 
-# Create a frame containing `address`
-fn Frame frame_containing(PhysicalAddress address)
+# --- primitives: irreducible NonZeroUsize / checked-arithmetic / bit ops ---
+
+fn int frame_physaddr(Frame self_frame)
+    rust
+        self_frame.physaddr.get() as i64
+
+# Builds a Frame from an address already known to be non-zero and page-aligned.
+fn Frame frame_from_addr(int addr)
     rust
         Frame {
-            physaddr: core::num::NonZeroUsize::new(address.data() & !PAGE_MASK)
+            physaddr: core::num::NonZeroUsize::new(addr as usize)
                 .expect("frame 0x0 is reserved"),
         }
 
+fn int phys_addr_value(PhysicalAddress address)
+    rust
+        address.data() as i64
+
+fn PhysicalAddress phys_addr_from_value(int addr)
+    rust
+        PhysicalAddress::new(addr as usize)
+
+fn int addr_mask_page(int addr)
+    rust
+        (addr as usize & !PAGE_MASK) as i64
+
+fn bool addr_add_pages_ok(int addr, int page_count)
+    rust
+        (addr as usize).checked_add(page_count as usize * PAGE_SIZE).is_some()
+
+fn bool addr_sub_ok(int addr, int from_addr)
+    rust
+        (addr as usize).checked_sub(from_addr as usize).is_some()
+
+fn int order_page_count(int order)
+    rust
+        (1usize << (order as u32)) as i64
+
+# --- native Deor: the actual "methods", as free functions calling the above ---
+
+# Create a frame containing `address`
+fn Frame frame_containing(PhysicalAddress address)
+    int addr = phys_addr_value(address)
+    int masked = addr_mask_page(addr)
+    if masked is 0
+        crash("frame 0x0 is reserved")
+    return frame_from_addr(masked)
+
 # Get the address of this frame
 fn PhysicalAddress frame_base(Frame self_frame)
-    rust
-        PhysicalAddress::new(self_frame.physaddr.get())
+    int addr = frame_physaddr(self_frame)
+    return phys_addr_from_value(addr)
 
 fn Frame frame_next_by(Frame self_frame, int page_count)
-    rust
-        Frame {
-            physaddr: self_frame
-                .physaddr
-                .get()
-                .checked_add(page_count as usize * PAGE_SIZE)
-                .and_then(core::num::NonZeroUsize::new)
-                .expect("overflow or null in Frame::next_by"),
-        }
+    int addr = frame_physaddr(self_frame)
+    bool add_ok = addr_add_pages_ok(addr, page_count)
+    if not add_ok
+        crash("overflow or null in Frame::next_by")
+    int next_addr = addr + page_count * PAGE_SIZE
+    return frame_from_addr(next_addr)
 
 fn int frame_offset_from(Frame self_frame, Frame from)
-    rust
-        (self_frame
-            .physaddr
-            .get()
-            .checked_sub(from.physaddr.get())
-            .expect("overflow in Frame::offset_from")
-            / PAGE_SIZE) as i64
+    int addr = frame_physaddr(self_frame)
+    int from_addr = frame_physaddr(from)
+    bool sub_ok = addr_sub_ok(addr, from_addr)
+    if not sub_ok
+        crash("overflow in Frame::offset_from")
+    int diff = addr - from_addr
+    return diff / PAGE_SIZE
 
 fn bool frame_is_aligned_to_order(Frame self_frame, int order)
-    rust
-        self_frame.base().data().is_multiple_of(PAGE_SIZE << (order as u32))
+    int addr = frame_physaddr(self_frame)
+    int page_count = order_page_count(order)
+    int size = page_count * PAGE_SIZE
+    return addr % size is 0
+
+# Thin inherent-method shims so the still-fully-rust functions further down
+# (allocate_p2frame_complex, deallocate_p2frame, init_sections, get_page_info)
+# can keep calling `frame.next_by(...)` / `Frame::containing(...)` with
+# ordinary Rust method syntax -- forwarding to the native-Deor functions
+# above, which is what they transpile to.
+rust
+    impl Frame {
+        pub fn containing(address: PhysicalAddress) -> Frame {
+            frame_containing(address)
+        }
+        pub fn base(self) -> PhysicalAddress {
+            frame_base(self)
+        }
+        #[track_caller]
+        pub fn next_by(self, n: usize) -> Self {
+            frame_next_by(self, n as i64)
+        }
+        pub fn offset_from(self, from: Self) -> usize {
+            frame_offset_from(self, from) as usize
+        }
+        pub fn is_aligned_to_order(self, order: u32) -> bool {
+            frame_is_aligned_to_order(self, order as i64)
+        }
+    }
 
 # ---------------------------------------------------------------------------
 # Enomem / RaiiFrame
@@ -379,10 +491,12 @@ rust
     #[derive(Debug)]
     pub struct Enomem;
 
-fn Error enomem_to_error(Enomem err)
+fn Error error_new_enomem()
     rust
-        let _ = err;
         Error::new(ENOMEM)
+
+fn Error enomem_to_error(Enomem err)
+    return error_new_enomem()
 
 raw RaiiFrameResult
 
@@ -421,11 +535,22 @@ fn Frame raiiframe_get(RaiiFrame self_frame)
     rust
         self_frame.inner
 
-fn Frame raiiframe_take(RaiiFrame self_frame)
+fn void raiiframe_forget(RaiiFrame self_frame)
     rust
-        let f = self_frame.inner;
-        core::mem::forget(self_frame);
-        f
+        core::mem::forget(self_frame)
+
+# NOTE: a real rough edge, left visible rather than papered over -- Deor
+# clones every function-call argument by default, which assumes the argument
+# type derives Clone. RaiiFrame deliberately does NOT derive Clone (that's
+# what makes it a reliable drop-once guard), so the two clone-by-default
+# calls below don't actually have a legal `.clone()` to call. The original
+# Rust takes `self` by value for exactly this reason. Shown as native Deor
+# for shape/readability, but this is a spot where the language's default
+# calling convention and a real ownership-guard type genuinely conflict.
+fn Frame raiiframe_take(RaiiFrame self_frame)
+    Frame frame = raiiframe_get(self_frame)
+    raiiframe_forget(self_frame)
+    return frame
 
 # ---------------------------------------------------------------------------
 # PageInfo -- packs refcount / free-list-order / prev-next into two
@@ -718,37 +843,137 @@ raw OptRefCount
 rust
     pub type OptRefCount = Option<RefCount>;
 
-fn OptRefCount refcount_from_raw(int raw_val)
+# --- generic bitwise primitives ---------------------------------------
+# Deor has no bitwise operators at all, so these are the shared one-line
+# escape hatches -- reusable across any masking/flag logic, not bespoke to
+# refcounts. Rust's `&`/`|`/`!` on `i64` operate on the exact same bit
+# pattern as the original `usize` code did; the top-bit masks below just
+# print as negative numbers when read back as a signed Deor `int`, which is
+# a cosmetic quirk of Deor only having a signed integer type, not a
+# correctness issue -- AND/OR/NOT only ever look at bit patterns.
+
+fn int bitwise_and(int a, int b)
     rust
-        let raw_val = raw_val as usize;
-        if raw_val & RC_USED_NOT_FREE != RC_USED_NOT_FREE {
-            // Refcount not meaningful for free pages.
-            return None;
-        }
-        let refcount = raw_val & !(RC_SHARED_NOT_COW | RC_USED_NOT_FREE);
+        a & b
 
-        // Refcount being zero means some other hw thread decreased it from one; hence it would be
-        // very invalid if this caller too, logically owned a reference to it. Reaching zero can for
-        // example occur if two threads simultaneously get Cow(2), then both fetch_sub
-        // simultaneously (meaning both are trying to free something). One of them will then notice
-        // it was the one decreasing from One, hence being responsible to free it.
-        let nz_refcount = core::num::NonZeroUsize::new(refcount)?;
+fn int bitwise_or(int a, int b)
+    rust
+        a | b
 
-        Some(if nz_refcount.get() == 1 {
-            RefCount::One
-        } else if raw_val & RC_SHARED_NOT_COW == RC_SHARED_NOT_COW {
-            RefCount::Shared(nz_refcount)
-        } else {
-            RefCount::Cow(nz_refcount)
-        })
+fn int bitwise_not(int a)
+    rust
+        !a
 
-fn int refcount_to_raw(RefCount self_rc)
+fn bool bitwise_test(int val, int mask)
+    rust
+        val & mask != 0
+
+fn int rc_used_not_free_mask()
+    rust
+        RC_USED_NOT_FREE as i64
+
+fn int rc_shared_not_cow_mask()
+    rust
+        RC_SHARED_NOT_COW as i64
+
+# --- RefCount construction/inspection primitives -----------------------
+# RefCount is `raw` because Shared/Cow carry a NonZeroUsize payload, which
+# Deor enum variants can never do -- so building or inspecting one always
+# needs a one-line call into Rust, even though the branching logic that
+# decides *which* variant applies is now plain Deor below.
+
+fn OptRefCount refcount_none()
+    rust
+        None
+
+fn OptRefCount refcount_some(RefCount value)
+    rust
+        Some(value)
+
+fn RefCount refcount_one()
+    rust
+        RefCount::One
+
+fn RefCount refcount_shared(int value)
+    rust
+        RefCount::Shared(core::num::NonZeroUsize::new(value as usize).expect("refcount_shared given zero"))
+
+fn RefCount refcount_cow(int value)
+    rust
+        RefCount::Cow(core::num::NonZeroUsize::new(value as usize).expect("refcount_cow given zero"))
+
+fn bool refcount_is_one(RefCount self_rc)
+    rust
+        matches!(self_rc, RefCount::One)
+
+fn bool refcount_is_shared(RefCount self_rc)
+    rust
+        matches!(self_rc, RefCount::Shared(_))
+
+fn int refcount_inner_value(RefCount self_rc)
     rust
         (match self_rc {
-            RefCount::One => 1 | RC_USED_NOT_FREE,
-            RefCount::Shared(inner) => inner.get() | RC_SHARED_NOT_COW | RC_USED_NOT_FREE,
-            RefCount::Cow(inner) => inner.get() | RC_USED_NOT_FREE,
+            RefCount::One => 1,
+            RefCount::Shared(inner) | RefCount::Cow(inner) => inner.get(),
         }) as i64
+
+# --- native Deor: the actual decode/encode logic -----------------------
+
+fn OptRefCount refcount_from_raw(int raw_val)
+    int used_mask = rc_used_not_free_mask()
+    bool used = bitwise_test(raw_val, used_mask)
+    if not used
+        # Refcount not meaningful for free pages.
+        return refcount_none()
+
+    int shared_mask = rc_shared_not_cow_mask()
+    int clear_mask = bitwise_or(shared_mask, used_mask)
+    int inv_clear_mask = bitwise_not(clear_mask)
+    int refcount = bitwise_and(raw_val, inv_clear_mask)
+
+    # Refcount being zero means some other hw thread decreased it from one; hence it would be
+    # very invalid if this caller too, logically owned a reference to it. Reaching zero can for
+    # example occur if two threads simultaneously get Cow(2), then both fetch_sub
+    # simultaneously (meaning both are trying to free something). One of them will then notice
+    # it was the one decreasing from One, hence being responsible to free it.
+    if refcount is 0
+        return refcount_none()
+
+    if refcount is 1
+        return refcount_some(refcount_one())
+
+    bool shared = bitwise_test(raw_val, shared_mask)
+    if shared
+        return refcount_some(refcount_shared(refcount))
+    return refcount_some(refcount_cow(refcount))
+
+fn int refcount_to_raw(RefCount self_rc)
+    int used_mask = rc_used_not_free_mask()
+    if refcount_is_one(self_rc)
+        int one = 1
+        return bitwise_or(one, used_mask)
+
+    int inner = refcount_inner_value(self_rc)
+    if refcount_is_shared(self_rc)
+        int shared_mask = rc_shared_not_cow_mask()
+        int combo_mask = bitwise_or(shared_mask, used_mask)
+        return bitwise_or(inner, combo_mask)
+
+    return bitwise_or(inner, used_mask)
+
+# Same inherent-method shim pattern as Frame above: the still-fully-rust
+# functions further down (pageinfo_remove_ref, pageinfo_refcount, init_mm,
+# init_frame) call `RefCount::from_raw(...)` / `.to_raw()` as ordinary Rust
+# methods -- forward those to the native-Deor functions just defined.
+rust
+    impl RefCount {
+        pub fn from_raw(raw: usize) -> Option<Self> {
+            refcount_from_raw(raw as i64)
+        }
+        pub fn to_raw(self) -> usize {
+            refcount_to_raw(self) as usize
+        }
+    }
 
 # ---------------------------------------------------------------------------
 # Sections -- the array-of-PageInfo-per-memory-region bookkeeping. Entirely
